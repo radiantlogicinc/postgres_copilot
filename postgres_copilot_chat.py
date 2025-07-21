@@ -663,14 +663,17 @@ class LiteLLMMcpClient:
                 base_message_to_user += f"\nExecution Error: {exec_error}\n"
             elif exec_result is not None:
                 preview_str = ""
-                if isinstance(exec_result, list) and len(exec_result) == 1 and isinstance(exec_result[0], dict):
-                    single_row_dict = exec_result[0]
-                    preview_str = str(single_row_dict)
-                elif isinstance(exec_result, str) and exec_result.endswith(".md"): # Path to markdown file
-                    preview_str = f"Query result saved to {os.path.basename(exec_result)}"
+                if isinstance(exec_result, dict) and exec_result.get("status") == "success":
+                    data = exec_result.get("data")
+                    if data and isinstance(data, list) and len(data) > 0:
+                        preview_str = str(data[0])
+                    elif 'message' in exec_result:
+                        preview_str = exec_result['message']
+                    else:
+                        preview_str = "Query executed successfully, but no rows were returned."
                 else:
                     preview_str = str(exec_result)
-                
+
                 if len(preview_str) > 200: # Truncate if too long
                     preview_str = preview_str[:197] + "..."
                 base_message_to_user += f"\nExecution successful. Result preview (1 row): {preview_str}\n"

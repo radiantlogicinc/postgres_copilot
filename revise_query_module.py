@@ -110,48 +110,89 @@ async def handle_revise_query_iteration(
     explanation = parsed_response.explanation
     execution_result = None
     execution_error = None
+    original_sql = sql_to_execute
+    original_explanation = explanation
 
-    try:
-        exec_result_obj = await client.session.call_tool(
-            "execute_postgres_query", 
-            {"query": sql_to_execute, "row_limit": row_limit_for_preview}
-        )
-        raw_exec_output = client._extract_mcp_tool_call_output(exec_result_obj)
-        if isinstance(raw_exec_output, str) and "Error:" in raw_exec_output:
-            execution_error = raw_exec_output
-        else:
-            execution_result = raw_exec_output
-    except Exception as e:
-        execution_error = handle_exception(e, user_query=user_revision_prompt, context={"step": "execute_revised_sql"})
+    for exec_attempt in range(MAX_REVISE_SQL_RETRIES + 1):
+        try:
+            exec_result_obj = await client.session.call_tool(
+                "execute_postgres_query", 
+                {"query": sql_to_execute, "row_limit": row_limit_for_preview}
+            )
+            raw_exec_output = client._extract_mcp_tool_call_output(exec_result_obj, "execute_postgres_query")
+
+            try:
+                if isinstance(raw_exec_output, str):
+                    exec_data = json.loads(raw_exec_output)
+                else:
+                    exec_data = raw_exec_output
+
+                if isinstance(exec_data, dict) and exec_data.get("status") == "error":
+                    execution_error = exec_data.get("message", "Unknown execution error.")
+                    
+                    if exec_attempt < MAX_REVISE_SQL_RETRIES:
+                        fix_prompt = (
+                            f"The previously revised SQL query resulted in an execution error.\n"
+                            f"CURRENT SQL WITH ERROR:\n```sql\n{sql_to_execute}\n```\n\n"
+                            f"EXECUTION ERROR MESSAGE:\n{execution_error}\n\n"
+                            f"USER'S REVISION REQUEST: \"{user_revision_prompt}\"\n\n"
+                            f"Please provide a corrected SQL query that fixes the error while still addressing the user's revision request. "
+                            f"For the explanation, describe how the *corrected* SQL query addresses the user's request. Do not mention the error or the fixing process.\n"
+                            f"Respond ONLY with a single JSON object: {{ \"sql_query\": \"<corrected SELECT query>\", \"explanation\": \"<explanation>\" }}"
+                        )
+                        
+                        fix_call_messages = client.conversation_history + [{"role": "user", "content": fix_prompt}]
+                        
+                        try:
+                            fix_llm_response_obj = await client._send_message_to_llm(fix_call_messages, user_revision_prompt)
+                            fix_text, _ = await client._process_llm_response(fix_llm_response_obj)
+
+                            if fix_text.startswith("```json"): fix_text = fix_text[7:]
+                            if fix_text.endswith("```"): fix_text = fix_text[:-3]
+                            fix_text = fix_text.strip()
+
+                            if fix_text:
+                                fixed_response = SQLRevisionResponse.model_validate_json(fix_text)
+                                if fixed_response.sql_query and fixed_response.sql_query.strip().upper().startswith("SELECT"):
+                                    sql_to_execute = fixed_response.sql_query
+                                    explanation = fixed_response.explanation
+                                    execution_error = None
+                                    continue
+                        except Exception as fix_e:
+                            handle_exception(fix_e, user_query=user_revision_prompt, context={"step": "fix_revised_sql_attempt", "attempt": exec_attempt + 1})
+                else:
+                    execution_result = exec_data
+                    execution_error = None
+                    break
+            except json.JSONDecodeError:
+                execution_result = raw_exec_output
+                execution_error = None
+                break
+        except Exception as e:
+            execution_error = handle_exception(e, user_query=user_revision_prompt, context={"step": "execute_revised_sql_loop", "attempt": exec_attempt + 1})
+            if exec_attempt >= MAX_REVISE_SQL_RETRIES:
+                break
+    
+    if execution_error and sql_to_execute != original_sql:
+        sql_to_execute = original_sql
+        explanation = original_explanation
 
     user_message = f"Revised SQL:\n```sql\n{sql_to_execute}\n```\n\nExplanation:\n{explanation}\n\n"
     if execution_error:
         user_message += f"Execution Error for revised SQL: {execution_error}\n"
     elif execution_result is not None:
         preview_str = ""
-        if isinstance(execution_result, list) and len(execution_result) == 1 and isinstance(execution_result[0], dict):
-            single_row_dict = execution_result[0]
-            preview_str = str(single_row_dict)
-        elif isinstance(execution_result, str) and execution_result.endswith(".md"): # Path to markdown file
-            # We need os.path.basename, but os is not imported here.
-            # For simplicity, just show the string if it's a path, or rely on the MCP server to not return full paths for previews.
-            # Or, assume the MCP server's `execute_postgres_query` with row_limit=1 for SELECT returns the row data directly, not a path.
-            # Given the context, direct row data is more likely for a preview.
-            preview_str = str(execution_result) # Fallback for now if it's a string path
-            if ".md" in preview_str: # Basic check for markdown path
-                 try:
-                     # Attempt to get basename if os is available through client or other means, else use as is
-                     # This part is tricky without direct os import. Assuming direct data for preview.
-                     # If MCP server returns path for row_limit=1, this needs rethink in MCP server.
-                     # For now, this will just show the path string if it's a path.
-                     pass # Keep preview_str as is if it's a path.
-                 except NameError: # os not defined
-                     pass
-
-
-        else: # General case if not list of one dict
+        if isinstance(execution_result, dict) and execution_result.get("status") == "success":
+            data = execution_result.get("data")
+            if data and isinstance(data, list) and len(data) > 0:
+                preview_str = str(data[0])
+            elif 'message' in execution_result:
+                preview_str = execution_result['message']
+            else:
+                preview_str = "Query executed successfully, but no rows were returned."
+        else:
             preview_str = str(execution_result)
-        
+
         if len(preview_str) > 200: # Truncate if too long
             preview_str = preview_str[:197] + "..."
         user_message += f"Execution of revised SQL successful. Result preview (1 row): {preview_str}\n"

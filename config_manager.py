@@ -74,7 +74,7 @@ def save_config(config_data: dict) -> None:
         config_path = get_config_file_path()
         with open(config_path, 'w') as f:
             json.dump(config_data, f, indent=4)
-        print(f"Configuration saved to {config_path}")
+        print(f"Configuration saved to current_working_directory/data/config/config.json")
     except IOError as e:
         handle_exception(e, user_query="save_config")
         print(f"Error: Could not save configuration file to {get_config_file_path()}. Please check permissions.")
@@ -86,7 +86,7 @@ def initial_setup() -> dict:
     config_path = get_config_file_path()
     print("Welcome to PostgreSQL Co-Pilot Setup!")
     print("------------------------------------")
-    print(f"A new configuration file has been created at: {config_path}")
+    print(f"A new configuration file has been created at: current_working_directory/data/config/config.json")
     print("Please open this file, fill in your details, and then type 'done' here to continue.")
 
     default_memory_path = get_default_data_dir() / "memory"
