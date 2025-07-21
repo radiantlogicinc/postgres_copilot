@@ -20,31 +20,27 @@ def load_and_filter_schema(db_name_identifier: str) -> Tuple[Optional[Dict[str, 
     # Create active_tables.txt if it doesn't exist
     active_tables_filepath = memory_module.get_active_tables_filepath(db_name_identifier)
     if not os.path.exists(active_tables_filepath):
-        # Filter for actual tables before writing to the scope file
-        all_table_names = [
+        # Include both tables and views when creating the file for the first time
+        all_object_names = [
             name for name, properties in schema_data_dict.items()
-            if properties.get('type') == 'TABLE'
+            if properties.get('type') in ('TABLE', 'VIEW')
         ]
         with open(active_tables_filepath, 'w') as f:
-            for table_name in all_table_names:
-                f.write(f"{table_name}\n")
+            for object_name in all_object_names:
+                f.write(f"{object_name}\n")
         print(f"\n[INFO] A new file has been created to manage the database scope.")
-        print(f"Please edit '{active_tables_filepath}' to add or remove tables for the Co-pilot to consider.")
+        print(f"Please edit '{active_tables_filepath}' to add or remove tables and views for the Co-pilot to consider.")
 
     # Filter the schema based on active_tables.txt
     try:
         with open(active_tables_filepath, 'r') as f:
             active_tables = [line.strip() for line in f if line.strip()]
         
-        # Now, the schema includes both tables and views.
-        # The active_tables.txt still only controls tables, but the schema will contain all objects.
+        # Filter the schema based on active_tables.txt for both tables and views
         filtered_schema = {}
         for item_name, properties in schema_data_dict.items():
-            # If it's a view, always include it.
-            if properties.get('type') == 'VIEW':
-                filtered_schema[item_name] = properties
-            # If it's a table, include it only if it's in the active_tables list.
-            elif properties.get('type') == 'TABLE' and item_name in active_tables:
+            # Include both tables and views only if they are in the active_tables list
+            if (properties.get('type') == 'TABLE' or properties.get('type') == 'VIEW') and item_name in active_tables:
                 filtered_schema[item_name] = properties
         
         if not filtered_schema:

@@ -229,61 +229,65 @@ async def generate_sql_query(
             )
             raw_exec_output = client._extract_mcp_tool_call_output(exec_result_obj, "execute_postgres_query")
 
-            if isinstance(raw_exec_output, str) and "Error:" in raw_exec_output:
-                execution_error = raw_exec_output
-                # print(f"Execution Error (Attempt {exec_attempt + 1}): {execution_error}") # User sees final error message
-                
-                if exec_attempt < MAX_SQL_EXECUTION_RETRIES:
-                    fix_user_message_content = (
-                        f"The previously generated SQL query resulted in an execution error.\n"
-                        f"DATABASE SCHEMA AND SAMPLE DATA:\n```json\n{schema_context_str}\n```\n\n"
-                        f"ORIGINAL NATURAL LANGUAGE QUESTION: \"{natural_language_question}\"\n\n"
-                        f"SQL QUERY WITH ERROR:\n```sql\n{sql_to_execute}\n```\n\n"
-                        f"EXECUTION ERROR MESSAGE:\n{execution_error}\n\n"
-                        f"Please provide a corrected SQL query. For the explanation, describe how the *corrected* SQL query answers the original NATURAL LANGUAGE QUESTION. Do not mention the error, the incorrect query, or the process of fixing it in your explanation. Focus solely on explaining the logic of the corrected query in relation to the user's question.\n"
-                        f"Respond ONLY with a single JSON object matching this structure: "
-                        f"{{ \"sql_query\": \"<Your corrected SELECT SQL query>\", \"explanation\": \"<Your explanation>\" }}\n"
-                        f"Ensure the SQL query strictly starts with 'SELECT'."
-                    )
+            try:
+                # Attempt to parse the output if it's a JSON string
+                if isinstance(raw_exec_output, str):
+                    exec_data = json.loads(raw_exec_output)
+                else:
+                    exec_data = raw_exec_output
+
+                # Check for error in the structured response
+                if isinstance(exec_data, dict) and exec_data.get("status") == "error":
+                    execution_error = exec_data.get("message", "Unknown execution error.")
                     
-                    # Use a temporary message list for this fix attempt
-                    fix_call_messages = client.conversation_history + [{"role": "user", "content": fix_user_message_content}]
-                    
-                    try:
-                        schema_tokens = token_utils.count_tokens(schema_context_str, client.model_name, client.provider)
-                        fix_llm_response_obj = await client._send_message_to_llm(fix_call_messages, natural_language_question, schema_tokens)
-                        fix_text, fix_tool_calls_made = await client._process_llm_response(fix_llm_response_obj)
-
-                        if fix_tool_calls_made:
-                            # print("LLM attempted tool call during SQL fix. Continuing with next attempt...") # Debug
-                            continue
-
-                        if fix_text.startswith("```json"): fix_text = fix_text[7:]
-                        if fix_text.endswith("```"): fix_text = fix_text[:-3]
-                        fix_text = fix_text.strip()
+                    if exec_attempt < MAX_SQL_EXECUTION_RETRIES:
+                        fix_user_message_content = (
+                            f"The previously generated SQL query resulted in an execution error.\n"
+                            f"DATABASE SCHEMA AND SAMPLE DATA:\n```json\n{schema_context_str}\n```\n\n"
+                            f"ORIGINAL NATURAL LANGUAGE QUESTION: \"{natural_language_question}\"\n\n"
+                            f"SQL QUERY WITH ERROR:\n```sql\n{sql_to_execute}\n```\n\n"
+                            f"EXECUTION ERROR MESSAGE:\n{execution_error}\n\n"
+                            f"Please provide a corrected SQL query. For the explanation, describe how the *corrected* SQL query answers the original NATURAL LANGUAGE QUESTION. Do not mention the error, the incorrect query, or the process of fixing it in your explanation. Focus solely on explaining the logic of the corrected query in relation to the user's question.\n"
+                            f"Respond ONLY with a single JSON object matching this structure: "
+                            f"{{ \"sql_query\": \"<Your corrected SELECT SQL query>\", \"explanation\": \"<Your explanation>\" }}\n"
+                            f"Ensure the SQL query strictly starts with 'SELECT'."
+                        )
                         
-                        if not fix_text:
-                            # print("LLM provided empty fix response. Continuing...") # Debug
-                            continue
-
-                        fixed_response = SQLGenerationResponse.model_validate_json(fix_text)
+                        fix_call_messages = client.conversation_history + [{"role": "user", "content": fix_user_message_content}]
                         
-                        if fixed_response.sql_query and fixed_response.sql_query.strip().upper().startswith("SELECT"):
-                            sql_to_execute = fixed_response.sql_query
-                            explanation = fixed_response.explanation
-                            execution_error = None 
-                            # print(f"SQL fixed by LLM for next attempt: {sql_to_execute}") # Debug
-                            continue 
-                        else:
-                            # print("LLM provided invalid SQL fix (not SELECT or missing query). Continuing...") # Debug
-                            pass # Fall through to continue with original SQL if fix is invalid
-                    except Exception as fix_e:
-                        handle_exception(fix_e, natural_language_question, {"context": "LLM SQL fix attempt", "attempt": exec_attempt + 1})
-                        pass # Fall through to continue
-            else:
+                        try:
+                            schema_tokens = token_utils.count_tokens(schema_context_str, client.model_name, client.provider)
+                            fix_llm_response_obj = await client._send_message_to_llm(fix_call_messages, natural_language_question, schema_tokens)
+                            fix_text, fix_tool_calls_made = await client._process_llm_response(fix_llm_response_obj)
+
+                            if fix_tool_calls_made:
+                                continue
+
+                            if fix_text.startswith("```json"): fix_text = fix_text[7:]
+                            if fix_text.endswith("```"): fix_text = fix_text[:-3]
+                            fix_text = fix_text.strip()
+                            
+                            if not fix_text:
+                                continue
+
+                            fixed_response = SQLGenerationResponse.model_validate_json(fix_text)
+                            
+                            if fixed_response.sql_query and fixed_response.sql_query.strip().upper().startswith("SELECT"):
+                                sql_to_execute = fixed_response.sql_query
+                                explanation = fixed_response.explanation
+                                execution_error = None 
+                                continue 
+                        except Exception as fix_e:
+                            handle_exception(fix_e, natural_language_question, {"context": "LLM SQL fix attempt", "attempt": exec_attempt + 1})
+                else:
+                    execution_result = exec_data
+                    execution_error = None
+                    break
+            except json.JSONDecodeError:
+                # If output is not a valid JSON, treat it as a potential success or non-error message
                 execution_result = raw_exec_output
                 execution_error = None
-                break 
+                break
                 
         except Exception as e:
             execution_error = handle_exception(e, natural_language_question, {"context": "SQL execution loop", "attempt": exec_attempt + 1, "sql_to_execute": sql_to_execute})
