@@ -97,7 +97,11 @@ async def generate_insights_from_revision_history(
             if client.model_name.startswith("gpt-") or client.model_name.startswith("openai/"):
                 response_format = {"type": "json_object"}
 
-            llm_response_obj = await client._send_message_to_llm(messages=messages_for_llm, response_format=response_format)
+            llm_response_obj = await client._send_message_to_llm(
+                messages=messages_for_llm, 
+                user_query=f"Insights generation from revision for {db_name_identifier}",
+                response_format=response_format
+            )
             response_text, _ = await client._process_llm_response(llm_response_obj)
 
             if response_text.startswith("```json"): response_text = response_text[7:]
