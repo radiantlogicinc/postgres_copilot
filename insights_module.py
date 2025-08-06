@@ -6,6 +6,8 @@ from error_handler_module import handle_exception, display_message
 # Assuming pydantic_models.py and memory_module.py are accessible
 from pydantic_models import InsightsExtractionModel, FeedbackReportContentModel
 import memory_module
+import hyde_feedback_module
+import join_path_finder
 
 # This module will interact with the LLM (via postgres_copilot_chat.py's _send_message_to_llm method)
 # So, the main function here will be called from postgres_copilot_chat.py,
@@ -14,7 +16,9 @@ import memory_module
 async def generate_and_update_insights(
     litellm_mcp_client_instance: Any, # Instance of LiteLLMMcpClient
     feedback_report_markdown_content: str,
-    db_name_identifier: str
+    db_name_identifier: str,
+    sql_query: str = None,  # Add SQL query parameter
+    user_feedback: str = None  # Add user feedback parameter
 ) -> bool:
     """
     Processes a feedback report to extract insights and updates the
@@ -32,21 +36,39 @@ async def generate_and_update_insights(
 
     # 1. Read existing insights for the specific database
     existing_insights_md_content = memory_module.read_insights_file(db_name_identifier)
-    # if existing_insights_md_content: # Debug
-    #     print(f"Read existing insights for '{db_name_identifier}' ({len(existing_insights_md_content)} chars).")
-    # else: # Debug
-    #     print(f"No existing insights file found for '{db_name_identifier}', or it's empty. LLM will generate fresh insights structure for this DB.")
     if not existing_insights_md_content:
-        existing_insights_md_content = "" 
+        existing_insights_md_content = ""
 
+    # --- HyDE: Retrieve Focused Schema Context ---
+    hyde_context = ""
+    table_names_from_hyde = []
+    if sql_query and user_feedback:
+        try:
+            hyde_context, table_names_from_hyde = await hyde_feedback_module.retrieve_hyde_feedback_context(
+                sql_query=sql_query,
+                user_feedback=user_feedback,
+                db_name_identifier=db_name_identifier,
+                llm_client=litellm_mcp_client_instance
+            )
+        except Exception as e_hyde:
+            handle_exception(e_hyde, user_feedback, {"context": "HyDE Context Retrieval for Feedback"})
+            hyde_context = "Failed to retrieve focused schema context via HyDE for feedback."
+    # --- End HyDE ---
 
-    # 2. Prepare prompt for LLM
-    # The LLM needs to understand the Pydantic structure of InsightsExtractionModel
-    # We can provide the model's JSON schema or a clear description.
-    
-    # For simplicity in the prompt, we'll describe the task and rely on the LLM's ability
-    # to understand the JSON output format based on an example or schema description.
-    # Providing the Pydantic model's JSON schema is more robust.
+    # --- Load Schema Graph and Find Join Path ---
+    schema_graph = memory_module.load_schema_graph(db_name_identifier)
+    join_path_str = "No deterministic join path could be constructed for feedback."
+    if schema_graph and table_names_from_hyde:
+        try:
+            join_clauses = join_path_finder.find_join_path(table_names_from_hyde, schema_graph)
+            if join_clauses:
+                join_path_str = "\n".join(join_clauses)
+        except Exception as e_join:
+            handle_exception(e_join, user_feedback, {"context": "Join Path Finder for Feedback"})
+            join_path_str = "Error constructing join path for feedback."
+    # --- End Join Path Finding ---
+
+    # 2. Prepare prompt for LLM with HyDE context
     insights_model_json_schema = InsightsExtractionModel.model_json_schema()
 
     prompt = f"""
@@ -56,6 +78,16 @@ You are an AI assistant tasked with analyzing a SQL query feedback report and up
 Extract key learnings, schema details, query best practices, common errors, and database-specific insights from the provided "NEW FEEDBACK REPORT CONTENT" for the database '{db_name_identifier}'.
 Then, intelligently merge these new insights into the "EXISTING INSIGHTS FOR '{db_name_identifier}'" structure.
 The goal is to build a rich, evolving knowledge base for this specific database.
+
+**RELEVANT DATABASE SCHEMA INFORMATION:**
+```
+{hyde_context}
+```
+
+**DETERMINISTIC JOIN PATH (If applicable):**
+```
+{join_path_str}
+```
 
 **Output Format:**
 Your final output MUST be a single JSON object that strictly conforms to the following Pydantic model schema for `InsightsExtractionModel`:

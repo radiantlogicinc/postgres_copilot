@@ -4,7 +4,7 @@ from datetime import datetime
 
 import memory_module
 
-def log_token_usage(origin_script, origin_line, user_query, prompt, prompt_tokens, schema_tokens, input_tokens, output_tokens, llm_response, model_id):
+def log_token_usage(origin_script, origin_line, user_query, prompt, prompt_tokens, schema_tokens, input_tokens, output_tokens, llm_response, model_id, command=None):
     """
     Logs the token usage of an LLM call to a JSON file.
 
@@ -19,6 +19,7 @@ def log_token_usage(origin_script, origin_line, user_query, prompt, prompt_token
         output_tokens (int): The number of output tokens from the LLM response.
         llm_response (str): The response from the LLM.
         model_id (str): The ID of the model used for the LLM call.
+        command (str, optional): The command context (/generate_sql, /revise, /feedback).
     """
     log_dir = os.path.join(memory_module.get_memory_base_path(), 'logs')
     log_file = os.path.join(log_dir, 'token_usage.json')
@@ -35,6 +36,7 @@ def log_token_usage(origin_script, origin_line, user_query, prompt, prompt_token
         'output_tokens': output_tokens,
         'llm_response': llm_response,
         'model_id': model_id,
+        'command': command,
     }
 
     if not os.path.exists(log_dir):

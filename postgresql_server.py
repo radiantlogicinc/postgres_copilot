@@ -153,6 +153,85 @@ def get_schema_and_sample_data(output_file_path: str) -> str:
         return json.dumps({"status": "error", "message": f"Server-side exception: {str(e)}\nTraceback:\n{tb_str}"})
 
 @mcp.tool()
+def get_foreign_key_relationships() -> str:
+    """
+    Queries the information_schema to retrieve all foreign key relationships.
+    Returns a JSON string with a list of relationship objects.
+    """
+    global db_connection
+    logger.debug("Tool 'get_foreign_key_relationships' called.")
+    if not db_connection:
+        logger.warning("No active database connection for 'get_foreign_key_relationships'.")
+        return json.dumps({"status": "error", "message": "Not connected to any database."})
+
+    query = """
+    SELECT
+        tc.table_name AS fk_table,
+        kcu.column_name AS fk_column,
+        ccu.table_name AS pk_table,
+        ccu.column_name AS pk_column
+    FROM
+        information_schema.table_constraints AS tc
+        JOIN information_schema.key_column_usage AS kcu
+          ON tc.constraint_name = kcu.constraint_name
+          AND tc.table_schema = kcu.table_schema
+        JOIN information_schema.constraint_column_usage AS ccu
+          ON ccu.constraint_name = tc.constraint_name
+          AND ccu.table_schema = tc.table_schema
+    WHERE tc.constraint_type = 'FOREIGN KEY';
+    """
+    try:
+        with db_connection.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query)
+            relationships = cur.fetchall()
+            logger.info(f"Successfully fetched {len(relationships)} foreign key relationships.")
+            return json.dumps({"status": "success", "data": relationships}, default=str)
+    except Exception as e:
+        logger.error(f"Error fetching foreign key relationships: {e}", exc_info=True)
+        return json.dumps({"status": "error", "message": f"Could not fetch foreign key relationships. {e}"})
+
+@mcp.tool()
+def get_stored_functions() -> str:
+    """
+    Fetches all stored functions from the database with their definitions and comments.
+    Returns a JSON string with function names, arguments, return types, definitions, and comments.
+    """
+    global db_connection
+    logger.debug("Tool 'get_stored_functions' called.")
+    if not db_connection:
+        logger.warning("No active database connection for 'get_stored_functions'.")
+        return json.dumps({"status": "error", "message": "Not connected to any database."})
+
+    query = """
+    SELECT 
+        n.nspname AS schema_name,
+        p.proname AS function_name,
+        pg_get_function_arguments(p.oid) AS function_arguments,
+        t.typname AS return_type,
+        pg_get_functiondef(p.oid) AS function_definition,
+        d.description AS function_comment
+    FROM 
+        pg_proc p
+        LEFT JOIN pg_namespace n ON p.pronamespace = n.oid
+        LEFT JOIN pg_type t ON p.prorettype = t.oid
+        LEFT JOIN pg_description d ON p.oid = d.objoid
+    WHERE 
+        n.nspname NOT IN ('pg_catalog', 'information_schema')
+        AND p.prokind = 'f'  -- 'f' for regular functions
+    ORDER BY 
+        n.nspname, p.proname;
+    """
+    try:
+        with db_connection.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query)
+            functions = cur.fetchall()
+            logger.info(f"Successfully fetched {len(functions)} stored functions.")
+            return json.dumps({"status": "success", "data": functions}, default=str)
+    except Exception as e:
+        logger.error(f"Error fetching stored functions: {e}", exc_info=True)
+        return json.dumps({"status": "error", "message": f"Could not fetch stored functions. {e}"})
+
+@mcp.tool()
 def execute_postgres_query(query: str) -> str:
     """
     Executes a given SQL query on the currently connected PostgreSQL database.
