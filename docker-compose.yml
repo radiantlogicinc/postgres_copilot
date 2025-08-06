@@ -1,0 +1,12 @@
+services:
+  postgres-copilot:
+    build:
+      context: .
+    volumes:
+      - ./data:/app/data
+    environment:
+      - POSTGRES_COPILOT_DATA_DIR=/app/data
+      - PYTHONUNBUFFERED=1
+    user: "${CURRENT_UID}:${CURRENT_GID}"
+    stdin_open: true
+    tty: true

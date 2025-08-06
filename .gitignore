@@ -1,0 +1,45 @@
+# Ignore everything
+*
+
+# But not these files...
+!.gitignore
+!run.sh
+!docker-compose.yml
+!README.md
+!LICENSE
+!Dockerfile
+!entrypoint.sh
+!requirements.txt
+!docker-compose.dist.yml
+!README.docker.md
+!docker-build-and-deploy-guide.md
+!README.md.dist
+
+# ...even if they are in subdirectories
+!*/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Logs
+*.log
+
+# Custom additions
+memory/
+passwords/

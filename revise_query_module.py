@@ -9,7 +9,9 @@ from pydantic_models import (
     RevisionReportContentModel
 )
 from error_handler_module import handle_exception
-# import memory_module # Removed as it's not used directly in this module
+import memory_module
+import hyde_revision_module
+import join_path_finder
 
 if TYPE_CHECKING:
     from postgres_copilot_chat import LiteLLMMcpClient
@@ -37,12 +39,42 @@ async def handle_revise_query_iteration(
     # Context for the LLM
     history_str = "\n".join([f"{item['role']}: {item['content']}" for item in revision_history_for_context])
 
+    # --- HyDE: Retrieve Focused Schema Context ---
+    hyde_context = ""
+    table_names_from_hyde = []
+    try:
+        hyde_context, table_names_from_hyde = await hyde_revision_module.retrieve_hyde_revision_context(
+            current_sql=current_sql_to_revise,
+            revision_prompt=user_revision_prompt,
+            db_name_identifier=client.current_db_name_identifier,
+            llm_client=client
+        )
+    except Exception as e_hyde:
+        handle_exception(e_hyde, user_revision_prompt, {"context": "HyDE Context Retrieval for Revision"})
+        hyde_context = "Failed to retrieve focused schema context via HyDE for revision."
+    # --- End HyDE ---
+
+    # --- Load Schema Graph and Find Join Path ---
+    schema_graph = memory_module.load_schema_graph(client.current_db_name_identifier)
+    join_path_str = "No deterministic join path could be constructed for revision."
+    if schema_graph and table_names_from_hyde:
+        try:
+            join_clauses = join_path_finder.find_join_path(table_names_from_hyde, schema_graph)
+            if join_clauses:
+                join_path_str = "\n".join(join_clauses)
+        except Exception as e_join:
+            handle_exception(e_join, user_revision_prompt, {"context": "Join Path Finder for Revision"})
+            join_path_str = "Error constructing join path for revision."
+    # --- End Join Path Finding ---
+
     prompt = (
         f"You are an expert PostgreSQL SQL reviser. The user wants to revise an existing SQL query.\n\n"
         f"CURRENT SQL QUERY TO REVISE:\n```sql\n{current_sql_to_revise}\n```\n\n"
         f"REVISION HISTORY (if any):\n{history_str}\n\n"
         f"USER'S LATEST REVISION REQUEST: \"{user_revision_prompt}\"\n\n"
-        f"Based on the current SQL and the user's latest request, generate a revised SQL query (must start with SELECT) and a brief explanation of the changes or how the new query addresses the request.\n"
+        f"RELEVANT DATABASE SCHEMA INFORMATION (Use this to construct the revised query):\n```\n{hyde_context}\n```\n\n"
+        f"DETERMINISTIC JOIN PATH (You MUST use these exact JOIN clauses in your query if applicable):\n```\n{join_path_str}\n```\n\n"
+        f"Based on the current SQL, the user's latest request, and the provided schema information, generate a revised SQL query (must start with SELECT) and a brief explanation of the changes or how the new query addresses the request.\n"
         f"Respond ONLY with a single JSON object matching this structure: "
         f"{{ \"sql_query\": \"<Your revised SELECT SQL query>\", \"explanation\": \"<Your explanation>\" }}\n"
         f"Ensure the SQL query strictly starts with 'SELECT'."
@@ -131,11 +163,38 @@ async def handle_revise_query_iteration(
                     execution_error = exec_data.get("message", "Unknown execution error.")
                     
                     if exec_attempt < MAX_REVISE_SQL_RETRIES:
+                        # --- HyDE for Error Correction ---
+                        error_hyde_context = ""
+                        error_table_names_from_hyde = []
+                        try:
+                            error_hyde_context, error_table_names_from_hyde = await hyde_revision_module.retrieve_hyde_revision_context(
+                                current_sql=sql_to_execute,
+                                revision_prompt=f"Fix this error: {execution_error}",  # Use error as feedback
+                                db_name_identifier=client.current_db_name_identifier,
+                                llm_client=client
+                            )
+                        except Exception as e_hyde:
+                            handle_exception(e_hyde, user_revision_prompt, {"context": "HyDE Context Retrieval for Error Correction"})
+                            error_hyde_context = "Failed to retrieve focused schema context via HyDE for error correction."
+                        
+                        # --- Load Schema Graph and Find Join Path for Error Correction ---
+                        error_join_path_str = "No deterministic join path could be constructed for error correction."
+                        if schema_graph and error_table_names_from_hyde:
+                            try:
+                                error_join_clauses = join_path_finder.find_join_path(error_table_names_from_hyde, schema_graph)
+                                if error_join_clauses:
+                                    error_join_path_str = "\n".join(error_join_clauses)
+                            except Exception as e_join:
+                                handle_exception(e_join, user_revision_prompt, {"context": "Join Path Finder for Error Correction"})
+                                error_join_path_str = "Error constructing join path for error correction."
+                        
                         fix_prompt = (
                             f"The previously revised SQL query resulted in an execution error.\n"
                             f"CURRENT SQL WITH ERROR:\n```sql\n{sql_to_execute}\n```\n\n"
                             f"EXECUTION ERROR MESSAGE:\n{execution_error}\n\n"
                             f"USER'S REVISION REQUEST: \"{user_revision_prompt}\"\n\n"
+                            f"RELEVANT DATABASE SCHEMA INFORMATION:\n```\n{error_hyde_context}\n```\n\n"
+                            f"DETERMINISTIC JOIN PATH (You MUST use these exact JOIN clauses in your query if applicable):\n```\n{error_join_path_str}\n```\n\n"
                             f"Please provide a corrected SQL query that fixes the error while still addressing the user's revision request. "
                             f"For the explanation, describe how the *corrected* SQL query addresses the user's request. Do not mention the error or the fixing process.\n"
                             f"Respond ONLY with a single JSON object: {{ \"sql_query\": \"<corrected SELECT query>\", \"explanation\": \"<explanation>\" }}"

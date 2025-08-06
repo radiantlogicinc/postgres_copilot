@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  postgres-copilot:
+    image: shivam124/postgres-copilot:latest
+    user: "${CURRENT_UID:-0}:${CURRENT_GID:-0}"
+    volumes:
+      - ./data:/home/appuser/data
+    environment:
+      - POSTGRES_COPILOT_DATA_DIR=/home/appuser/data
+    stdin_open: true  # Keep STDIN open
+    tty: true         # Allocate a pseudo-TTY

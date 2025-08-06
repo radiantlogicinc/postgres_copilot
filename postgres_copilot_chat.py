@@ -24,10 +24,10 @@ import revision_insights_module # Added
 import database_navigation_module
 import revise_query_module # Added
 import vector_store_module # Added for RAG
-import model_change_module # Added for /change_model
 import error_handler_module
 import token_utils
 from token_logging_module import log_token_usage
+from token_tracking_module import TokenTracker
 from colorama import Fore, Style, init as colorama_init # Added for Colorama
 import config_manager # Changed to absolute import
 import inspect
@@ -58,6 +58,9 @@ class LiteLLMMcpClient:
         self.model_name = self.app_config.get("model_id") # Get from app_config
         self.provider = self.app_config.get("llm_provider")
         self.llm_api_key = self.app_config.get("api_key") # Store for potential direct use if needed
+        
+        # Initialize token tracker
+        self.token_tracker = TokenTracker()
         
         # Determine model provider based on model name prefix
         # Provider name from config_data['llm_provider'] can also be used directly
@@ -290,6 +293,16 @@ class LiteLLMMcpClient:
                 output_tokens = response.usage.completion_tokens
                 llm_response = response.choices[0].message.content
 
+                # Get current command from the stack trace
+                current_command = None
+                if 'sql_generation_module.py' in origin_script:
+                    current_command = 'generate_sql'
+                elif 'revise_query_module.py' in origin_script:
+                    current_command = 'revise'
+                
+                # Add tokens to tracker
+                self.token_tracker.add_tokens(input_tokens, output_tokens)
+
                 log_token_usage(
                     origin_script=origin_script,
                     origin_line=origin_line,
@@ -300,7 +313,8 @@ class LiteLLMMcpClient:
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     llm_response=llm_response,
-                    model_id=self.model_name
+                    model_id=self.model_name,
+                    command=current_command
                 )
                 
                 # Add user message to history (assistant response added after processing)
@@ -427,12 +441,12 @@ class LiteLLMMcpClient:
         return assistant_response_content, tool_calls_made
 
 
-    async def _handle_initialization(self, connection_string: str, db_name_id: str):
+    async def _handle_initialization(self, connection_string: str, db_name_id: str, force_regenerate: bool = False):
         """Handles the full DB initialization flow."""
         await self._cleanup_database_session(full_cleanup=True) # Clean slate for new DB
         
         success, message, schema_data = await initialization_module.perform_initialization(
-            self, connection_string, db_name_id
+            self, connection_string, db_name_id, force_regenerate=force_regenerate
         )
         if success:
             self.is_initialized = True
@@ -447,6 +461,61 @@ class LiteLLMMcpClient:
         else:
             await self._cleanup_database_session(full_cleanup=True) 
             error_handler_module.display_message(message, level="ERROR")
+
+    async def _handle_config_change(self, change_type: str):
+        """Handles guiding the user to edit the config file for model or db changes."""
+        config = config_manager.load_config()
+        config_path = config_manager.get_config_file_path()
+        display_path = config_manager.translate_path_for_display(str(config_path))
+
+        if change_type == "model":
+            profiles = config.get("llm_profiles", {})
+            print("Available LLM profiles:")
+            for alias, profile_data in profiles.items():
+                print(f"- {alias} (Provider: {profile_data.get('provider')}, Model: {profile_data.get('model_id')})")
+            print(f"\nTo change the active LLM, please edit the 'active_llm_profile_alias' in your config file.")
+        
+        elif change_type == "database":
+            connections = config.get("database_connections", {})
+            print("Available database connections:")
+            for alias, conn_str in connections.items():
+                print(f"- {alias}: {conn_str}")
+            print(f"\nTo change the active database, please edit the 'active_database_alias' in your config file.")
+
+        print(f"\nConfiguration file location: {display_path}")
+        print("After saving your changes to the file, type 'done' and press Enter to reload.")
+
+        while True:
+            user_input = await asyncio.get_event_loop().run_in_executor(None, lambda: input("").strip().lower())
+            if user_input == 'done':
+                break
+            else:
+                print("Please type 'done' to continue.")
+        
+        print("Reloading configuration...")
+        self.app_config = config_manager.get_app_config()
+        
+        # Re-initialize based on the change type
+        if change_type == "model":
+            self.model_name = self.app_config.get("model_id")
+            self.llm_api_key = self.app_config.get("api_key")
+            # ... (rest of model change logic)
+            self.conversation_history = []
+            if self.system_instruction_content:
+                self.conversation_history.append({"role": "system", "content": self.system_instruction_content})
+            final_message = (
+                f"Configuration reloaded. Active model is now: {self.model_name}\n"
+                f"Conversation history has been reset."
+            )
+            error_handler_module.display_response(final_message)
+
+        elif change_type == "database":
+            conn_str = self.app_config.get("active_database_connection_string")
+            db_alias = self.app_config.get("active_database_alias")
+            if conn_str and db_alias:
+                await self._handle_initialization(conn_str, db_alias, force_regenerate=False)
+            else:
+                error_handler_module.display_message("Could not find an active database in the reloaded configuration.", level="ERROR")
 
     async def dispatch_command(self, query: str):
         if not self.session:
@@ -468,129 +537,20 @@ class LiteLLMMcpClient:
 
         # Command: /change_model
         if base_command_lower == "change_model":
-            # The new handle_change_model_interactive saves the config file itself.
-            # We need to reload the config if it returns success.
-            success, message = await model_change_module.handle_change_model_interactive(self.app_config)
-            
-            if success:
-                print("Reloading configuration with new profile...")
-                # Reload the app_config from the updated file
-                self.app_config = config_manager.get_app_config()
-                
-                # Update client's internal LLM settings from the newly loaded app_config
-                self.model_name = self.app_config.get("model_id")
-                self.llm_api_key = self.app_config.get("api_key")
-                
-                new_provider_name = self.app_config.get("llm_provider", "Unknown").capitalize()
-                # This logic correctly re-evaluates the provider display name
-                if self.model_name.startswith("gemini/"): self.model_provider = "Google AI (Gemini)"
-                elif self.model_name.startswith("gpt-") or self.model_name.startswith("openai/"): self.model_provider = "OpenAI"
-                elif self.model_name.startswith("bedrock/"):
-                    self.model_provider = "AWS Bedrock"
-                    if "claude" in self.model_name.lower(): self.model_provider += " (Anthropic Claude)"
-                elif self.model_name.startswith("anthropic/") or self.model_name.startswith("claude"): self.model_provider = "Anthropic"
-                elif self.model_name.startswith("ollama/"): self.model_provider = "Ollama (Local)"
-                else: self.model_provider = new_provider_name
-                
-                # Reset conversation history as the context might be irrelevant for a new model/provider
-                self.conversation_history = []
-                if self.system_instruction_content:
-                   self.conversation_history.append({"role": "system", "content": self.system_instruction_content})
-                
-                final_message = (
-                    f"{message}\n"
-                    f"Client updated to use new profile. Active model: {self.model_name} from {self.model_provider}.\n"
-                    f"Conversation history has been reset."
-                )
-                error_handler_module.display_response(final_message)
-            else:
-                # Display cancellation or error message from the module
-                error_handler_module.display_response(message)
+            await self._handle_config_change("model")
             return
 
-        # Command: /change_profile
-        if base_command_lower == "change_profile":
-            config = config_manager.load_config()
-            profiles = config.get("llm_profiles", {})
-            if len(profiles) <= 1:
-                error_handler_module.display_response("Only one profile exists. Add more profiles to use this command.")
-                return
-
-            print("Please choose a profile to switch to:")
-            profile_aliases = list(profiles.keys())
-            for i, alias in enumerate(profile_aliases):
-                print(f"{i+1}. {alias}")
-            
-            choice = -1
-            while choice < 1 or choice > len(profile_aliases):
-                try:
-                    raw_choice = input(f"Enter your choice (1-{len(profile_aliases)}): ")
-                    choice = int(raw_choice)
-                except ValueError:
-                    print("Invalid input. Please enter a number.")
-            
-            chosen_alias = profile_aliases[choice - 1]
-            config["active_llm_profile_alias"] = chosen_alias
-            config_manager.save_config(config)
-            
-            print(f"Reloading configuration with new profile '{chosen_alias}'...")
-            # Manually rebuild app_config to avoid the double prompt from get_app_config()
-            active_profile = config.get("llm_profiles", {}).get(chosen_alias)
-            if not active_profile:
-                error_handler_module.display_message(f"Error: Could not find the selected profile '{chosen_alias}' after saving.", level="ERROR")
-                return
-
-            app_config = {
-                "memory_base_dir": config.get("memory_base_dir"),
-                "approved_queries_dir": config.get("approved_queries_dir"),
-                "nl2sql_vector_store_base_dir": config.get("nl2sql_vector_store_base_dir"),
-                "llm_provider": active_profile.get("provider"),
-                "model_id": f"{active_profile.get('provider')}/{active_profile.get('model_id')}",
-                "active_database_alias": config.get("active_database_alias"),
-                "active_database_connection_string": config.get("database_connections", {}).get(config.get("active_database_alias"))
-            }
-            credentials = active_profile.get("credentials", {})
-            app_config.update(credentials)
-            self.app_config = app_config
-
-            self.model_name = self.app_config.get("model_id")
-            self.llm_api_key = self.app_config.get("api_key")
-            new_provider_name = self.app_config.get("llm_provider", "Unknown").capitalize()
-            if self.model_name.startswith("gemini/"): self.model_provider = "Google AI (Gemini)"
-            elif self.model_name.startswith("gpt-") or self.model_name.startswith("openai/"): self.model_provider = "OpenAI"
-            elif self.model_name.startswith("bedrock/"):
-                self.model_provider = "AWS Bedrock"
-                if "claude" in self.model_name.lower(): self.model_provider += " (Anthropic Claude)"
-            elif self.model_name.startswith("anthropic/") or self.model_name.startswith("claude"): self.model_provider = "Anthropic"
-            elif self.model_name.startswith("ollama/"): self.model_provider = "Ollama (Local)"
-            else: self.model_provider = new_provider_name
-            self.conversation_history = []
-            if self.system_instruction_content:
-                self.conversation_history.append({"role": "system", "content": self.system_instruction_content})
-            final_message = (
-                f"Active profile switched to '{chosen_alias}'.\n"
-                f"Client updated to use new profile. Active model: {self.model_name} from {self.model_provider}.\n"
-                f"Conversation history has been reset."
-            )
-            error_handler_module.display_response(final_message)
-            return
-
-        # Handle initialization attempts first
+        # Command: /change_database
         elif base_command_lower == "change_database":
-            raw_conn_str = argument_text
-            if raw_conn_str.startswith('"') and raw_conn_str.endswith('"'): # Handle quoted string
-                raw_conn_str = raw_conn_str[1:-1]
-            parsed_conn_str, parsed_db_name_id = self._extract_connection_string_and_db_name(raw_conn_str)
-            if not parsed_conn_str:
-                error_handler_module.display_message("Invalid connection string format provided with /change_database. Expected: postgresql://user:pass@host:port/dbname", level="ERROR")
-                return
-            await self._handle_initialization(parsed_conn_str, parsed_db_name_id)
+            # This command now also uses the file-based approach
+            await self._handle_config_change("database")
+            return
 
         # Check for implicit initialization if not already initialized
         elif not self.is_initialized:
             parsed_conn_str, parsed_db_name_id = self._extract_connection_string_and_db_name(query) # Use original query for implicit check
             if parsed_conn_str:
-                await self._handle_initialization(parsed_conn_str, parsed_db_name_id)
+                await self._handle_initialization(parsed_conn_str, parsed_db_name_id, force_regenerate=False)
                 return # Exit after handling implicit initialization
             else:
                 # If not initialized and not an attempt to initialize (via /change_database or raw string),
@@ -620,6 +580,16 @@ class LiteLLMMcpClient:
             else:
                 error_handler_module.display_message(f"Failed to reload scope: {message}", level="ERROR")
             return
+            
+        # Command: /regenerate_schema
+        elif base_command_lower == "regenerate_schema":
+            if not self.is_initialized or not self.current_db_name_identifier or not self.current_db_connection_string:
+                error_handler_module.display_message("Please connect to a database first with /change_database.", level="ERROR")
+                return
+            
+            print("Regenerating schema vectors and graph...")
+            await self._handle_initialization(self.current_db_connection_string, self.current_db_name_identifier, force_regenerate=True)
+            return
 
         # Command: /generate_sql
         elif base_command_lower == "generate_sql":
@@ -630,11 +600,18 @@ class LiteLLMMcpClient:
             self._reset_feedback_cycle_state()
             self._reset_revision_cycle_state()
             self.current_natural_language_question = nl_question
+            
+            # Start token tracking for this command
+            self.token_tracker.start_command("generate_sql")
+            
             print("Generating SQL, please wait...")
             sql_gen_result_dict = await sql_generation_module.generate_sql_query(
                 self, nl_question, self.db_schema_and_sample_data, self.cumulative_insights_content,
                 row_limit_for_preview=1 # Ensure 1 row for preview from sql_generation_module
             )
+            
+            # End token tracking and get usage
+            token_usage = self.token_tracker.end_command()
             
             if sql_gen_result_dict.get("sql_query"):
                 self.current_feedback_report_content = FeedbackReportContentModel(
@@ -707,6 +684,15 @@ class LiteLLMMcpClient:
                         base_message_to_user += "\n\n--- Could not retrieve similar examples due to an error. ---"
             # --- End Augment ---
             
+            # Add token usage information to the message
+            if token_usage:
+                token_usage_message = f"\n\nToken Usage for this SQL generation:\n" \
+                                     f"Input tokens: {token_usage['input_tokens']}\n" \
+                                     f"Output tokens: {token_usage['output_tokens']}\n" \
+                                     f"Total tokens: {token_usage['total_tokens']}\n" \
+                                     f"Conversation total: {token_usage['conversation_total']} tokens"
+                base_message_to_user += token_usage_message
+            
             error_handler_module.display_response(base_message_to_user)
 
         # Command: /feedback
@@ -715,6 +701,10 @@ class LiteLLMMcpClient:
             if not user_feedback_text:
                 error_handler_module.display_message("Please provide your feedback text after /feedback.", level="ERROR")
                 return
+                
+            # Start token tracking for this command
+            self.token_tracker.start_command("feedback")
+            
             print("Processing feedback, please wait...")
 
             if self.is_in_revision_mode and self.current_revision_report_content and self.current_revision_report_content.final_revised_sql_query:
@@ -732,7 +722,7 @@ class LiteLLMMcpClient:
                     f"Respond ONLY with a single JSON object matching this structure: "
                     f"{{ \"sql_query\": \"<Your corrected SELECT SQL query>\", \"explanation\": \"<Your explanation for the correction>\" }}\n"
                 )
-                MAX_FEEDBACK_RETRIES_IN_REVISION = 1
+                MAX_FEEDBACK_RETRIES_IN_REVISION = 4
                 corrected_sql_from_feedback = None
                 corrected_explanation_from_feedback = None
 
@@ -793,8 +783,11 @@ class LiteLLMMcpClient:
                     try:
                         exec_obj = await self.session.call_tool("execute_postgres_query", {"query": corrected_sql_from_feedback, "row_limit": 1})
                         raw_output = self._extract_mcp_tool_call_output(exec_obj, "execute_postgres_query")
+                        # Check for errors in different formats
                         if isinstance(raw_output, str) and "Error:" in raw_output:
                             exec_error = raw_output
+                        elif isinstance(raw_output, dict) and raw_output.get("status") == "error":
+                            exec_error = raw_output.get("message", "Unknown execution error")
                         else:
                             exec_result = raw_output
                     except Exception as e_exec:
@@ -817,7 +810,17 @@ class LiteLLMMcpClient:
                         if len(preview_str) > 200:
                             preview_str = preview_str[:197] + "..."
                         user_msg += f"\nExecution of new SQL successful. Result preview (1 row): {preview_str}\n"
-                    user_msg += "Use `/revise Your new prompt`, more `/feedback`, or `/approve_revision`."
+                    
+                    # End token tracking and get usage
+                    token_usage = self.token_tracker.end_command()
+                    if token_usage:
+                        user_msg += f"\nToken Usage for this feedback:\n" \
+                                   f"Input tokens: {token_usage['input_tokens']}\n" \
+                                   f"Output tokens: {token_usage['output_tokens']}\n" \
+                                   f"Total tokens: {token_usage['total_tokens']}\n" \
+                                   f"Conversation total: {token_usage['conversation_total']} tokens"
+                    
+                    user_msg += "\nUse `/revise Your new prompt`, more `/feedback`, or `/approve_revision`."
                     error_handler_module.display_response(user_msg)
                 else:
                     error_handler_module.display_message("Failed to apply feedback to the revised query.", level="ERROR")
@@ -844,7 +847,7 @@ class LiteLLMMcpClient:
                     f"Ensure the `corrected_sql_attempt` and `final_corrected_sql_query` start with SELECT."
                 )
                 
-                MAX_FEEDBACK_RETRIES = 1
+                MAX_FEEDBACK_RETRIES = 4
                 for attempt in range(MAX_FEEDBACK_RETRIES + 1):
                     try:
                         messages_for_llm = self.conversation_history + [{"role": "user", "content": feedback_prompt}]
@@ -874,8 +877,11 @@ class LiteLLMMcpClient:
                         try:
                             exec_obj = await self.session.call_tool("execute_postgres_query", {"query": updated_report_model.final_corrected_sql_query, "row_limit": 1})
                             raw_output = self._extract_mcp_tool_call_output(exec_obj, "execute_postgres_query")
+                            # Check for errors in different formats
                             if isinstance(raw_output, str) and "Error:" in raw_output:
                                 exec_error = raw_output
+                            elif isinstance(raw_output, dict) and raw_output.get("status") == "error":
+                                exec_error = raw_output.get("message", "Unknown execution error")
                             else:
                                 exec_result = raw_output
                         except Exception as e_exec:
@@ -898,7 +904,17 @@ class LiteLLMMcpClient:
                             if len(preview_str) > 200:
                                 preview_str = preview_str[:197] + "..."
                             user_msg += f"\nExecution of new SQL successful. Result preview (1 row): {preview_str}\n"
-                        user_msg += "Provide more /feedback or use /approved to save."
+                        
+                        # End token tracking and get usage
+                        token_usage = self.token_tracker.end_command()
+                        if token_usage:
+                            user_msg += f"\nToken Usage for this feedback:\n" \
+                                       f"Input tokens: {token_usage['input_tokens']}\n" \
+                                       f"Output tokens: {token_usage['output_tokens']}\n" \
+                                       f"Total tokens: {token_usage['total_tokens']}\n" \
+                                       f"Conversation total: {token_usage['conversation_total']} tokens"
+                        
+                        user_msg += "\nProvide more /feedback or use /approved to save."
                         error_handler_module.display_response(user_msg)
                         return
 
@@ -922,6 +938,9 @@ class LiteLLMMcpClient:
                 error_handler_module.display_message("No feedback report to approve. Use /generate_sql first.", level="ERROR")
                 return
 
+            # Start token tracking for this command
+            self.token_tracker.start_command("approved")
+            
             print("Processing approval and updating memory, please wait...") # User-facing wait message
             try:
                 # 1. Save Feedback Markdown
@@ -963,6 +982,16 @@ class LiteLLMMcpClient:
                 final_user_message = f"Approved. Feedback report, insights, and NLQ-SQL pair for '{self.current_db_name_identifier}' saved."
                 # Remove technical error message about insights update failure
                 
+                # End token tracking and get usage
+                token_usage = self.token_tracker.end_command()
+                if token_usage:
+                    token_usage_message = f"\nToken Usage for this approval:\n" \
+                                         f"Input tokens: {token_usage['input_tokens']}\n" \
+                                         f"Output tokens: {token_usage['output_tokens']}\n" \
+                                         f"Total tokens: {token_usage['total_tokens']}\n" \
+                                         f"Conversation total: {token_usage['conversation_total']} tokens"
+                    final_user_message += token_usage_message
+                
                 self._reset_feedback_cycle_state()
                 self._reset_revision_cycle_state() # Also reset revision state on approval
                 error_handler_module.display_response(f"{final_user_message}\nYou can start a new query with /generate_sql.")
@@ -976,6 +1005,9 @@ class LiteLLMMcpClient:
             if not revision_prompt:
                 error_handler_module.display_message("Please provide a revision prompt after /revise.", level="ERROR")
                 return
+                
+            # Start token tracking for this command
+            self.token_tracker.start_command("revise")
             
             sql_to_start_revision_with = None
             if self.is_in_revision_mode and self.current_revision_report_content and self.current_revision_report_content.final_revised_sql_query:
@@ -1023,6 +1055,17 @@ class LiteLLMMcpClient:
                 self.current_revision_report_content.final_revised_explanation = revision_result.get("revised_explanation", "N/A")
             
             message = revision_result.get("message_to_user", "Error in revision process.")
+            
+            # End token tracking and get usage
+            token_usage = self.token_tracker.end_command()
+            if token_usage and "Error" not in message:
+                token_usage_message = f"\n\nToken Usage for this revision:\n" \
+                                     f"Input tokens: {token_usage['input_tokens']}\n" \
+                                     f"Output tokens: {token_usage['output_tokens']}\n" \
+                                     f"Total tokens: {token_usage['total_tokens']}\n" \
+                                     f"Conversation total: {token_usage['conversation_total']} tokens"
+                message += token_usage_message
+                
             if "Error" in message:
                 error_handler_module.display_message(message, level="ERROR")
             else:
@@ -1033,6 +1076,9 @@ class LiteLLMMcpClient:
             if not self.is_in_revision_mode or not self.current_revision_report_content or not self.current_revision_report_content.final_revised_sql_query:
                 error_handler_module.display_message("No active revision cycle or final revised SQL to approve. Use /revise first.", level="ERROR")
                 return
+                
+            # Start token tracking for this command
+            self.token_tracker.start_command("approve_revision")
 
             # print("Finalizing revision and generating NLQ, please wait...") # User requested removal of such prints
             final_sql = self.current_revision_report_content.final_revised_sql_query
@@ -1175,6 +1221,16 @@ class LiteLLMMcpClient:
                         except Exception as e_rev_ins:
                             error_handler_module.display_message(f"Error during revision insights generation: {e_rev_ins}", level="ERROR")
                     
+                    # End token tracking and get usage
+                    token_usage = self.token_tracker.end_command()
+                    if token_usage:
+                        token_usage_message = f"\nToken Usage for this approval:\n" \
+                                             f"Input tokens: {token_usage['input_tokens']}\n" \
+                                             f"Output tokens: {token_usage['output_tokens']}\n" \
+                                             f"Total tokens: {token_usage['total_tokens']}\n" \
+                                             f"Conversation total: {token_usage['conversation_total']} tokens"
+                        user_msg_parts.append(token_usage_message)
+                    
                     user_msg_parts.append("You can start a new query with /generate_sql.")
                     self._reset_revision_cycle_state() 
                     error_handler_module.display_response("\n".join(user_msg_parts))
@@ -1186,7 +1242,14 @@ class LiteLLMMcpClient:
                 error_handler_module.display_message(message, level="ERROR")
         
         elif base_command_lower in ["list_commands", "help", "?"]:
-            error_handler_module.display_response(self._get_commands_help_text())
+            help_text = self._get_commands_help_text()
+            
+            # Add token usage information if available
+            if self.token_tracker.conversation_total_input_tokens > 0 or self.token_tracker.conversation_total_output_tokens > 0:
+                token_usage_message = f"\n\nCurrent Token Usage:\n{self.token_tracker.get_command_history_message()}"
+                help_text += token_usage_message
+                
+            error_handler_module.display_response(help_text)
 
         # If it's not a recognized command and starts with "/", it's unknown.
         elif query.startswith("/"):
@@ -1198,14 +1261,11 @@ class LiteLLMMcpClient:
             # If not a command (doesn't start with "/"), treat as navigation query
             # DO NOT reset feedback/revision state here.
             
-            # Apply active table scope if it exists
-            schema_for_query = self.db_schema_and_sample_data
-            if self.active_table_scope is not None:
-                schema_for_query = {k: v for k, v in self.db_schema_and_sample_data.items() if k in self.active_table_scope}
-
+            # Do not pass schema to database navigation module
+            # It will fetch table names directly from the database
             nav_response = await database_navigation_module.handle_navigation_query(
                 self, query, self.current_db_name_identifier, 
-                self.cumulative_insights_content, schema_for_query
+                self.cumulative_insights_content
             )
             error_handler_module.display_response(nav_response)
 
@@ -1227,10 +1287,12 @@ class LiteLLMMcpClient:
             "    - Approves the final SQL from a /revise cycle. Generates an NLQ and saves the pair. Insights are generated based on revision history.\n"
             "  /reload_scope\n"
             "    - Reloads the table scope from the active_tables.txt file.\n"
+            "  /regenerate_schema\n"
+            "    - Forces regeneration of schema vectors and graph even if they already exist.\n"
             "  /change_model\n"
-            "    - Interactively changes the LLM provider, API credentials, and model ID.\n"
-            "  /change_profile\n"
-            "    - Interactively changes the LLM profile.\n"
+            "    - Guides you to change the active LLM profile in the config file.\n"
+            "  /change_database\n"
+            "    - Guides you to change the active database connection in the config file.\n"
             "  /list_commands, /help, /?\n"
             "    - Shows this list of available commands.\n"
             "  Or, type a natural language question without a '/' prefix to ask about the current database schema or insights."
@@ -1243,7 +1305,9 @@ class LiteLLMMcpClient:
         
         if initial_setup_done:
             print(f"\n{Fore.YELLOW}Welcome! Initial configuration complete.{Style.RESET_ALL}")
-            print(f"{Fore.YELLOW}Your settings have been saved to: {config_manager.get_config_file_path()}{Style.RESET_ALL}")
+            config_path = config_manager.get_config_file_path()
+            display_path = config_manager.translate_path_for_display(str(config_path))
+            print(f"{Fore.YELLOW}Your settings have been saved to: {display_path}{Style.RESET_ALL}")
             print(self._get_commands_help_text())
         else:
             print(f"\n{Fore.CYAN}Type '/help', '/?' or '/list_commands' to see available commands.{Style.RESET_ALL}")
@@ -1348,7 +1412,7 @@ async def main():
             conn_str = app_config["active_database_connection_string"]
             parsed_conn_str, parsed_db_name_id = client._extract_connection_string_and_db_name(conn_str)
             if parsed_conn_str and parsed_db_name_id:
-                await client._handle_initialization(parsed_conn_str, parsed_db_name_id)
+                await client._handle_initialization(parsed_conn_str, parsed_db_name_id, force_regenerate=False)
             else:
                 error_handler_module.display_message(f"The default connection string '{app_config.get('active_database_alias')}' is invalid. Please check your config.json.", level="WARNING")
         # --- End Auto-initialize ---
@@ -1363,7 +1427,8 @@ async def main():
             conversation_history_base_dir.mkdir(parents=True, exist_ok=True)
             history_file_path = conversation_history_base_dir / f"conversation_litellm_{timestamp}.json"
             
-            print(f"\n{Fore.CYAN}Saving conversation history to: {history_file_path}{Style.RESET_ALL}")
+            display_path = config_manager.translate_path_for_display(str(history_file_path))
+            print(f"\n{Fore.CYAN}Saving conversation history to: {display_path}{Style.RESET_ALL}")
             try:
                 with open(history_file_path, "w", encoding="utf-8") as f:
                     # Save as JSON for better structure, especially with tool calls
