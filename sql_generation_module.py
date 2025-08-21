@@ -50,7 +50,8 @@ async def generate_sql_query(
     natural_language_question: str,
     schema_and_sample_data: Optional[Dict[str, Any]], # Combined DDL and sample data
     insights_markdown_content: Optional[str], # Content of summarized_insights.md
-    row_limit_for_preview: int = 1 # Added for controlling preview rows
+    row_limit_for_preview: int = 1, # Added for controlling preview rows
+    command_type: str = "generate_sql" # Added for conversation history management
 ) -> Dict[str, Any]:
     """
     Generates an SQL query based on a natural language question, schema data, and insights using LiteLLM.
@@ -197,14 +198,38 @@ async def generate_sql_query(
 
         try:
             # We expect a JSON response, so no tools are passed for this specific call.
+            # Count tokens for the complete prompt
+            prompt_text = user_message_content
+            prompt_tokens = token_utils.count_tokens(current_prompt, client.model_name, client.provider)
+            
+            # Count tokens for schema context
             schema_tokens = token_utils.count_tokens(schema_context_str, client.model_name, client.provider)
-            llm_response_obj = await client._send_message_to_llm(current_call_messages, natural_language_question, schema_tokens)
+            
+            # Count tokens for insights context
+            insights_tokens = token_utils.count_tokens(insights_context_str, client.model_name, client.provider)
+            
+            # Count tokens for few-shot examples
+            few_shot_tokens = token_utils.count_tokens(few_shot_examples_str, client.model_name, client.provider)
+            
+            # Track insights tokens separately
+            client.token_tracker.add_insights_tokens(insights_tokens)
+            
+            # Calculate other prompt tokens (prompt tokens minus schema and insights tokens)
+            other_prompt_tokens = prompt_tokens - schema_tokens - insights_tokens - few_shot_tokens
+            if other_prompt_tokens < 0:
+                other_prompt_tokens = 0
+            
+            # Track schema tokens and other prompt tokens separately
+            client.token_tracker.add_tokens(0, 0, schema_tokens=schema_tokens, other_prompt_tokens=other_prompt_tokens)
+            
+            # Send the message to the LLM - this will also track tokens via client.token_tracker
+            llm_response_obj = await client._send_message_to_llm(current_call_messages, natural_language_question, schema_tokens, source='sql_generation', command_type="generate_sql")
             # _send_message_to_llm adds the user prompt to client.conversation_history
             # _process_llm_response will add the assistant's response
             
             # _process_llm_response returns (text_content, tool_calls_made)
             # For this call, we expect tool_calls_made to be False.
-            llm_response_text, tool_calls_made = await client._process_llm_response(llm_response_obj)
+            llm_response_text, tool_calls_made = await client._process_llm_response(llm_response_obj, command_type="generate_sql")
 
             if tool_calls_made:
                 last_error_feedback_to_llm = "Your response included an unexpected tool call. Please provide the JSON response directly."
@@ -334,9 +359,22 @@ async def generate_sql_query(
                         fix_call_messages = client.conversation_history + [{"role": "user", "content": fix_user_message_content}]
                         
                         try:
+                            # Count tokens for the complete prompt
+                            fix_prompt_tokens = token_utils.count_tokens(fix_user_message_content, client.model_name, client.provider)
+                            
+                            # Count tokens for detailed schema context
                             schema_tokens = token_utils.count_tokens(detailed_schema_context, client.model_name, client.provider)
-                            fix_llm_response_obj = await client._send_message_to_llm(fix_call_messages, natural_language_question, schema_tokens)
-                            fix_text, fix_tool_calls_made = await client._process_llm_response(fix_llm_response_obj)
+                            
+                            # Calculate other prompt tokens
+                            other_prompt_tokens = fix_prompt_tokens - schema_tokens
+                            if other_prompt_tokens < 0:
+                                other_prompt_tokens = 0
+                                
+                            # Track schema tokens and other prompt tokens separately
+                            client.token_tracker.add_tokens(0, 0, schema_tokens=schema_tokens, other_prompt_tokens=other_prompt_tokens)
+                            
+                            fix_llm_response_obj = await client._send_message_to_llm(fix_call_messages, natural_language_question, schema_tokens, source='sql_generation', command_type="generate_sql")
+                            fix_text, fix_tool_calls_made = await client._process_llm_response(fix_llm_response_obj, command_type="generate_sql")
 
                             if fix_tool_calls_made:
                                 continue
@@ -402,7 +440,8 @@ async def regenerate_sql_query(
     user_feedback: str,
     schema_and_sample_data: Optional[Dict[str, Any]],
     insights_markdown_content: Optional[str],
-    row_limit_for_preview: int = 1
+    row_limit_for_preview: int = 1,
+    command_type: str = "feedback" # Added for conversation history management
 ) -> Dict[str, Any]:
     """
     Regenerates an SQL query based on user feedback, using the HyDE approach.
@@ -537,9 +576,33 @@ async def regenerate_sql_query(
         current_call_messages = messages_for_llm + [{"role": "user", "content": user_message_content}]
 
         try:
+            # Count tokens for the complete prompt
+            prompt_text = user_message_content
+            prompt_tokens = token_utils.count_tokens(current_prompt, client.model_name, client.provider)
+            
+            # Count tokens for schema context
             schema_tokens = token_utils.count_tokens(schema_context_str, client.model_name, client.provider)
-            llm_response_obj = await client._send_message_to_llm(current_call_messages, user_feedback, schema_tokens)
-            llm_response_text, tool_calls_made = await client._process_llm_response(llm_response_obj)
+            
+            # Count tokens for insights context
+            insights_tokens = token_utils.count_tokens(insights_context_str, client.model_name, client.provider)
+            
+            # Count tokens for few-shot examples
+            few_shot_tokens = token_utils.count_tokens(few_shot_examples_str, client.model_name, client.provider)
+            
+            # Track insights tokens separately
+            client.token_tracker.add_insights_tokens(insights_tokens)
+            
+            # Calculate other prompt tokens (prompt tokens minus schema and insights tokens)
+            other_prompt_tokens = prompt_tokens - schema_tokens - insights_tokens - few_shot_tokens
+            if other_prompt_tokens < 0:
+                other_prompt_tokens = 0
+            
+            # Track schema tokens and other prompt tokens separately
+            client.token_tracker.add_tokens(0, 0, schema_tokens=schema_tokens, other_prompt_tokens=other_prompt_tokens)
+            
+            # Send the message to the LLM - this will also track tokens via client.token_tracker
+            llm_response_obj = await client._send_message_to_llm(current_call_messages, user_feedback, schema_tokens, source='sql_generation', command_type="feedback")
+            llm_response_text, tool_calls_made = await client._process_llm_response(llm_response_obj, command_type="feedback")
 
             if tool_calls_made:
                 last_error_feedback_to_llm = "Your response included an unexpected tool call. Please provide the JSON response directly."
@@ -665,9 +728,23 @@ async def regenerate_sql_query(
                         fix_call_messages = client.conversation_history + [{"role": "user", "content": fix_prompt}]
                         
                         try:
+                            # Count tokens for the complete prompt
+                            fix_prompt_tokens = token_utils.count_tokens(fix_prompt, client.model_name, client.provider)
+                            
+                            # Count tokens for error schema context
                             schema_tokens = token_utils.count_tokens(error_hyde_context, client.model_name, client.provider)
-                            fix_llm_response_obj = await client._send_message_to_llm(fix_call_messages, user_feedback, schema_tokens)
-                            fix_text, _ = await client._process_llm_response(fix_llm_response_obj)
+                            
+                            # Calculate other prompt tokens
+                            other_prompt_tokens = fix_prompt_tokens - schema_tokens
+                            if other_prompt_tokens < 0:
+                                other_prompt_tokens = 0
+                                
+                            # Track schema tokens and other prompt tokens separately
+                            client.token_tracker.add_tokens(0, 0, schema_tokens=schema_tokens, other_prompt_tokens=other_prompt_tokens)
+                            
+                            # Send the message to the LLM - this will also track tokens via client.token_tracker
+                            fix_llm_response_obj = await client._send_message_to_llm(fix_call_messages, user_feedback, schema_tokens, source='sql_generation', command_type="feedback")
+                            fix_text, _ = await client._process_llm_response(fix_llm_response_obj, command_type="feedback")
 
                             if fix_text.startswith("```json"): fix_text = fix_text[7:]
                             if fix_text.endswith("```"): fix_text = fix_text[:-3]

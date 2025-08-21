@@ -8,6 +8,7 @@ from pydantic_models import InsightsExtractionModel, FeedbackReportContentModel
 import memory_module
 import hyde_feedback_module
 import join_path_finder
+from token_utils import count_tokens
 
 # This module will interact with the LLM (via postgres_copilot_chat.py's _send_message_to_llm method)
 # So, the main function here will be called from postgres_copilot_chat.py,
@@ -144,8 +145,16 @@ Your entire response should be ONLY this JSON object.
         current_call_messages = messages_for_llm + [{"role": "user", "content": current_user_prompt_content}]
 
         try:
+            # Count tokens for the prompt
+            schema_tokens = 0  # No schema in this case
+            
             # Call LLM using the client's method. We expect JSON, so no tools.
-            llm_response_obj = await litellm_mcp_client_instance._send_message_to_llm(current_call_messages, f"Insights generation for {db_name_identifier}")
+            # This will also track tokens via client.token_tracker
+            llm_response_obj = await litellm_mcp_client_instance._send_message_to_llm(
+                current_call_messages, 
+                f"Insights generation for {db_name_identifier}",
+                schema_tokens
+            )
             # _send_message_to_llm adds the user prompt to client.conversation_history
             # _process_llm_response will add the assistant's response and return the text content
             

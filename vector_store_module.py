@@ -175,7 +175,7 @@ def search_similar_nlqs(db_name_identifier: str, query_nlq: str, k: int = 5, thr
             
             # Convert L2 squared distance to cosine similarity.
             # This requires the original vectors to be normalized, or we re-calculate.
-            # For simplicity, let's use the 1 / (1 + sqrt(dist)) heuristic for now,
+            # For simplicity, let's use the 1 / (1 + (dist)) heuristic for now,
             # acknowledging it's not true cosine similarity.
             # A better approach would be to store normalized vectors and use dot product,
             # or use LanceDB's built-in cosine distance if an index is configured for it.

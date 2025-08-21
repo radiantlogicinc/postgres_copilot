@@ -12,6 +12,7 @@ from error_handler_module import handle_exception
 import memory_module
 import hyde_revision_module
 import join_path_finder
+import token_utils
 
 if TYPE_CHECKING:
     from postgres_copilot_chat import LiteLLMMcpClient
@@ -25,6 +26,7 @@ async def handle_revise_query_iteration(
     user_revision_prompt: str,
     current_sql_to_revise: str,
     revision_history_for_context: List[Dict[str, str]], # List of {"role": "user/assistant", "content": ...}
+    insights_markdown_content: Optional[str] = None, # Added for insights integration
     row_limit_for_preview: int = 1 # Added for controlling preview rows
 ) -> Dict[str, Any]:
     """
@@ -67,6 +69,11 @@ async def handle_revise_query_iteration(
             join_path_str = "Error constructing join path for revision."
     # --- End Join Path Finding ---
 
+    # Add insights context
+    insights_context_str = "No cumulative insights provided."
+    if insights_markdown_content and insights_markdown_content.strip():
+        insights_context_str = insights_markdown_content
+
     prompt = (
         f"You are an expert PostgreSQL SQL reviser. The user wants to revise an existing SQL query.\n\n"
         f"CURRENT SQL QUERY TO REVISE:\n```sql\n{current_sql_to_revise}\n```\n\n"
@@ -74,6 +81,7 @@ async def handle_revise_query_iteration(
         f"USER'S LATEST REVISION REQUEST: \"{user_revision_prompt}\"\n\n"
         f"RELEVANT DATABASE SCHEMA INFORMATION (Use this to construct the revised query):\n```\n{hyde_context}\n```\n\n"
         f"DETERMINISTIC JOIN PATH (You MUST use these exact JOIN clauses in your query if applicable):\n```\n{join_path_str}\n```\n\n"
+        f"CUMULATIVE INSIGHTS FROM PREVIOUS QUERIES (Use these to improve your query):\n```markdown\n{insights_context_str}\n```\n\n"
         f"Based on the current SQL, the user's latest request, and the provided schema information, generate a revised SQL query (must start with SELECT) and a brief explanation of the changes or how the new query addresses the request.\n"
         f"Respond ONLY with a single JSON object matching this structure: "
         f"{{ \"sql_query\": \"<Your revised SELECT SQL query>\", \"explanation\": \"<Your explanation>\" }}\n"
@@ -99,8 +107,18 @@ async def handle_revise_query_iteration(
         current_call_messages = messages_for_llm + [{"role": "user", "content": user_message_content}]
 
         try:
-            llm_response_obj = await client._send_message_to_llm(current_call_messages, user_revision_prompt)
-            llm_response_text, tool_calls_made = await client._process_llm_response(llm_response_obj)
+            # Count tokens for the schema context
+            schema_tokens = token_utils.count_tokens(hyde_context, client.model_name, client.provider)
+            
+            # Count tokens for insights context
+            insights_tokens = token_utils.count_tokens(insights_context_str, client.model_name, client.provider)
+            
+            # Track insights tokens separately
+            client.token_tracker.add_insights_tokens(insights_tokens)
+            
+            # Send the message to the LLM - this will also track tokens via client.token_tracker
+            llm_response_obj = await client._send_message_to_llm(current_call_messages, user_revision_prompt, schema_tokens, command_type="revise")
+            llm_response_text, tool_calls_made = await client._process_llm_response(llm_response_obj, command_type="revise")
 
             if tool_calls_made:
                 last_error_feedback_to_llm = "Error: Your response included an unexpected tool call."
@@ -203,8 +221,12 @@ async def handle_revise_query_iteration(
                         fix_call_messages = client.conversation_history + [{"role": "user", "content": fix_prompt}]
                         
                         try:
-                            fix_llm_response_obj = await client._send_message_to_llm(fix_call_messages, user_revision_prompt)
-                            fix_text, _ = await client._process_llm_response(fix_llm_response_obj)
+                            # Count tokens for error schema context
+                            schema_tokens = token_utils.count_tokens(error_hyde_context, client.model_name, client.provider)
+                            
+                            # Send the message to the LLM - this will also track tokens via client.token_tracker
+                            fix_llm_response_obj = await client._send_message_to_llm(fix_call_messages, user_revision_prompt, schema_tokens, command_type="revise")
+                            fix_text, _ = await client._process_llm_response(fix_llm_response_obj, command_type="revise")
 
                             if fix_text.startswith("```json"): fix_text = fix_text[7:]
                             if fix_text.endswith("```"): fix_text = fix_text[:-3]
@@ -311,8 +333,12 @@ async def generate_nlq_for_revised_sql(
         
         current_call_messages = messages_for_llm + [{"role": "user", "content": user_message_content}]
         try:
-            llm_response_obj = await client._send_message_to_llm(current_call_messages, "generate_nlq_for_revised_sql")
-            llm_response_text, tool_calls_made = await client._process_llm_response(llm_response_obj)
+            # We don't have schema in this case, but we should count the revision summary as it can be substantial
+            revision_tokens = token_utils.count_tokens(revision_summary_str, client.model_name, client.provider)
+            
+            # Send the message to the LLM - this will also track tokens via client.token_tracker
+            llm_response_obj = await client._send_message_to_llm(current_call_messages, "generate_nlq_for_revised_sql", revision_tokens, command_type="revise")
+            llm_response_text, tool_calls_made = await client._process_llm_response(llm_response_obj, command_type="revise")
 
             if tool_calls_made:
                 last_error_feedback_to_llm = "Error: Your response included an unexpected tool call."

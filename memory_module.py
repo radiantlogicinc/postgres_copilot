@@ -87,6 +87,11 @@ def get_schema_graph_filepath(db_name_identifier: str) -> Path:
     schema_dir = get_memory_base_path() / "schema"
     return schema_dir / f"{db_name_identifier}_schema_graph.json"
 
+def get_schema_backup_filepath(db_name_identifier: str) -> Path:
+    """Constructs the full path for the schema backup text file."""
+    schema_dir = get_memory_base_path() / "schema"
+    return schema_dir / f"schema_{db_name_identifier}_backup.txt"
+
 # --- Feedback Report Handling ---
 
 def _format_feedback_report_to_markdown(report_content: FeedbackReportContentModel) -> str:

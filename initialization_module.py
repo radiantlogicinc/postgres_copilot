@@ -214,19 +214,10 @@ async def perform_initialization(
         vectors_exist = check_schema_vectors_exist(db_name_identifier)
         graph_exists = check_schema_graph_exists(db_name_identifier)
         
-        # --- New: Vectorize Schema for HyDE (if needed) ---
-        if not vectors_exist or force_regenerate:
-            try:
-                print("[INFO] Vectorizing schema for enhanced search...")
-                schema_vectorization_module.vectorize_and_store_schema(db_name_identifier, filtered_schema)
-                print("[INFO] Schema vectorization complete.")
-            except Exception as e:
-                # Log the error but don't fail the entire initialization
-                handle_exception(e, context={"step": "vectorize_schema"}, message="Could not vectorize schema, but continuing.")
-        else:
-            print("[INFO] Using existing schema vectors.")
-
         # --- New: Generate and Save Schema Graph (if needed) ---
+        schema_graph = None
+        foreign_key_relationships = None
+        
         if not graph_exists or force_regenerate:
             try:
                 print("[INFO] Generating schema relationship graph...")
@@ -235,10 +226,69 @@ async def perform_initialization(
                 if schema_graph:
                     memory_module.save_schema_graph(db_name_identifier, schema_graph)
                     print("[INFO] Schema relationship graph saved.")
+                    
+                    # Extract foreign key relationships from the schema graph
+                    if 'edges' in schema_graph:
+                        foreign_key_relationships = []
+                        for edge in schema_graph['edges']:
+                            source = edge.get('source')
+                            target = edge.get('target')
+                            label = edge.get('label')
+                            
+                            if source and target and label:
+                                # Parse the label which is in format "fk_column → pk_column"
+                                parts = label.split(' → ')
+                                if len(parts) == 2:
+                                    fk_column = parts[0]
+                                    pk_column = parts[1]
+                                    foreign_key_relationships.append({
+                                        'fk_table': source,
+                                        'fk_column': fk_column,
+                                        'pk_table': target,
+                                        'pk_column': pk_column
+                                    })
             except Exception as e:
                 handle_exception(e, context={"step": "generate_schema_graph"}, message="Could not generate schema graph, but continuing.")
         else:
             print("[INFO] Using existing schema graph.")
+            # Load the existing schema graph to extract foreign key relationships
+            schema_graph = memory_module.load_schema_graph(db_name_identifier)
+            if schema_graph and 'edges' in schema_graph:
+                foreign_key_relationships = []
+                for edge in schema_graph['edges']:
+                    source = edge.get('source')
+                    target = edge.get('target')
+                    label = edge.get('label')
+                    
+                    if source and target and label:
+                        # Parse the label which is in format "fk_column → pk_column"
+                        parts = label.split(' → ')
+                        if len(parts) == 2:
+                            fk_column = parts[0]
+                            pk_column = parts[1]
+                            foreign_key_relationships.append({
+                                'fk_table': source,
+                                'fk_column': fk_column,
+                                'pk_table': target,
+                                'pk_column': pk_column
+                            })
+
+        # --- New: Vectorize Schema for HyDE (if needed) ---
+        if not vectors_exist or force_regenerate:
+            try:
+                print("[INFO] Vectorizing schema for enhanced search...")
+                schema_vectorization_module.vectorize_and_store_schema(
+                    db_name_identifier, 
+                    filtered_schema, 
+                    foreign_key_relationships,
+                    force_regenerate=force_regenerate
+                )
+                print("[INFO] Schema vectorization complete.")
+            except Exception as e:
+                # Log the error but don't fail the entire initialization
+                handle_exception(e, context={"step": "vectorize_schema"}, message="Could not vectorize schema, but continuing.")
+        else:
+            print("[INFO] Using existing schema vectors.")
         
         # --- Process stored functions (only when regenerating schema or changing database) ---
         if force_regenerate or not vectors_exist or not graph_exists:
