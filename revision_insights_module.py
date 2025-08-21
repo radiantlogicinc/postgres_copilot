@@ -97,9 +97,14 @@ async def generate_insights_from_revision_history(
             if client.model_name.startswith("gpt-") or client.model_name.startswith("openai/"):
                 response_format = {"type": "json_object"}
 
+            # Count tokens for the prompt
+            schema_tokens = 0  # No schema in this case
+            
+            # Send the message to the LLM - this will also track tokens via client.token_tracker
             llm_response_obj = await client._send_message_to_llm(
                 messages=messages_for_llm, 
                 user_query=f"Insights generation from revision for {db_name_identifier}",
+                schema_tokens=schema_tokens,
                 response_format=response_format
             )
             response_text, _ = await client._process_llm_response(llm_response_obj)
@@ -122,21 +127,13 @@ async def generate_insights_from_revision_history(
         return False
 
     # 3. Read existing insights
-    existing_insights_str = memory_module.read_insights_file(db_name_identifier)
-    existing_insights_model: Optional[InsightsExtractionModel] = None
-    if existing_insights_str:
-        try:
-            # The read_insights_file might return a string that needs parsing if it's from an old format
-            # or directly the model if it was saved as such.
-            # For safety, try to parse if it's a string.
-            # memory_module.save_or_update_insights now saves the full model as JSON string.
-            existing_insights_data = json.loads(existing_insights_str)
-            existing_insights_model = InsightsExtractionModel.model_validate(existing_insights_data)
-        except (json.JSONDecodeError, ValidationError) as e:
-            handle_exception(e, user_query=f"Parsing existing insights for {db_name_identifier}")
-            existing_insights_model = InsightsExtractionModel() # Start fresh
-    else:
-        existing_insights_model = InsightsExtractionModel() # Create a new empty model
+    existing_insights_md_content = memory_module.read_insights_file(db_name_identifier)
+    if not existing_insights_md_content:
+        existing_insights_md_content = ""
+    
+    # We'll create a new empty model for the LLM to populate
+    # The LLM will use the markdown content directly in the prompt
+    existing_insights_model = InsightsExtractionModel() # Create a new empty model
 
     # 4. Merge new insights with existing ones (LLM-assisted or rule-based)
     # For simplicity here, we'll do a basic merge. A more advanced LLM call could refine this.

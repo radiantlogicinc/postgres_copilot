@@ -82,6 +82,16 @@ def get_active_tables_filepath(db_name_identifier: str) -> str:
     schema_dir = get_memory_base_path() / "schema"
     return str(schema_dir / f"active_tables_for_{db_name_identifier}.txt")
 
+def get_schema_graph_filepath(db_name_identifier: str) -> Path:
+    """Constructs the full path for the schema graph JSON file."""
+    schema_dir = get_memory_base_path() / "schema"
+    return schema_dir / f"{db_name_identifier}_schema_graph.json"
+
+def get_schema_backup_filepath(db_name_identifier: str) -> Path:
+    """Constructs the full path for the schema backup text file."""
+    schema_dir = get_memory_base_path() / "schema"
+    return schema_dir / f"schema_{db_name_identifier}_backup.txt"
+
 # --- Feedback Report Handling ---
 
 def _format_feedback_report_to_markdown(report_content: FeedbackReportContentModel) -> str:
@@ -337,6 +347,31 @@ def read_schema_data(db_name: str) -> Optional[Dict[str, Any]]:
         return data
     except (IOError, json.JSONDecodeError) as e:
         handle_exception(e, user_query=f"read_schema_data for {db_name}")
+        return None
+
+def save_schema_graph(db_name_identifier: str, graph_data: Dict[str, Any]):
+    """Saves the generated schema graph to a JSON file."""
+    ensure_memory_directories()
+    filepath = get_schema_graph_filepath(db_name_identifier)
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(graph_data, f, indent=2)
+    except (IOError, TypeError) as e:
+        handle_exception(e, user_query=f"save_schema_graph for {db_name_identifier}")
+        raise
+
+def load_schema_graph(db_name_identifier: str) -> Optional[Dict[str, Any]]:
+    """Loads the schema graph JSON file for a given database."""
+    ensure_memory_directories()
+    filepath = get_schema_graph_filepath(db_name_identifier)
+    if not filepath.exists():
+        return None
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data
+    except (IOError, json.JSONDecodeError) as e:
+        handle_exception(e, user_query=f"load_schema_graph for {db_name_identifier}")
         return None
 
 import vector_store_module

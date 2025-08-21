@@ -10,6 +10,18 @@ APP_AUTHOR = "PostgresCopilotTeam" # Or your actual author/org name
 
 CONFIG_FILE_NAME = "config.json"
 
+def translate_path_for_display(path_str: str) -> str:
+    """
+    Translates internal container paths to user-friendly local paths for display.
+    If running in Docker, converts /app/data/... to ./data/...
+    Otherwise, returns the original path.
+    """
+    docker_data_dir = os.environ.get('POSTGRES_COPILOT_DATA_DIR')
+    if docker_data_dir and isinstance(path_str, str) and path_str.startswith(docker_data_dir):
+        # Replace /app/data with ./data
+        return path_str.replace(docker_data_dir, "./data", 1)
+    return path_str
+
 # --- Path Management ---
 
 def get_config_dir() -> Path:
@@ -74,19 +86,22 @@ def save_config(config_data: dict) -> None:
         config_path = get_config_file_path()
         with open(config_path, 'w') as f:
             json.dump(config_data, f, indent=4)
-        print(f"Configuration saved to current_working_directory/data/config/config.json")
+        display_path = translate_path_for_display(str(config_path))
+        print(f"Configuration saved to {display_path}")
     except IOError as e:
         handle_exception(e, user_query="save_config")
-        print(f"Error: Could not save configuration file to {get_config_file_path()}. Please check permissions.")
+        display_path = translate_path_for_display(str(get_config_file_path()))
+        print(f"Error: Could not save configuration file to {display_path}. Please check permissions.")
 
 # --- Initial Setup ---
 
 def initial_setup() -> dict:
     """Creates a default config.json and guides the user to edit it."""
     config_path = get_config_file_path()
+    display_path = translate_path_for_display(str(config_path))
     print("Welcome to PostgreSQL Co-Pilot Setup!")
     print("------------------------------------")
-    print(f"A new configuration file has been created at: current_working_directory/data/config/config.json")
+    print(f"A new configuration file has been created at: {display_path}")
     print("Please open this file, fill in your details, and then type 'done' here to continue.")
 
     default_memory_path = get_default_data_dir() / "memory"
